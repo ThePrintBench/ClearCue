@@ -3,9 +3,12 @@
 # Pre-build:  turns custom_product_name / custom_ota_base_url from platformio.ini
 #             into PRODUCT_NAME / DEFAULT_OTA_URL defines.
 # Post-build: writes the release artifacts into web/ :
-#   web/firmware/<slug>-<ver>-factory.bin  merged bootloader+partitions+boot_app0+app at 0x0
-#                                          (ESP Web Tools + production flashing)
-#   web/firmware/<slug>-<ver>-app.bin      app-only image (OTA + "upload .bin" on the settings page)
+#   web/firmware/<slug>-<ver>-factory.bin  merged bootloader+partitions+boot_app0+app at 0x0.
+#                                          Production flashing only: it overwrites NVS (settings).
+#   web/firmware/<slug>-<ver>-app.bin      app-only image (OTA, "upload .bin", and the web flasher)
+#   web/firmware/<slug>-<ver>-{bootloader,partitions,boot_app0}.bin
+#                                          separate pieces for the web flasher, which writes them at
+#                                          their own offsets and so leaves NVS (settings) alone
 # Versioned names make every release a new URL, so no cache can serve a stale image
 # under a manifest that advertises a newer version. Older versions are left in place
 # (handy for rollback); prune web/firmware/ yourself when you want.
@@ -57,11 +60,13 @@ def make_release(source, target, env):
     factory = os.path.join(fw_dir, factory_name)
     app_out = os.path.join(fw_dir, app_name)
 
-    parts = []
-    for offset, image in env.get("FLASH_EXTRA_IMAGES", []):
-        parts += [env.subst(offset), env.subst(image)]
-    parts += [env.subst("$ESP32_APP_OFFSET"), app]
+    # (offset, file) for every piece of a full install: bootloader, partition table,
+    # boot_app0 (OTA data) and the app.
+    pieces = [(env.subst(o), env.subst(i)) for o, i in env.get("FLASH_EXTRA_IMAGES", [])]
+    pieces.append((env.subst("$ESP32_APP_OFFSET"), app))
 
+    # 1) Factory image: everything merged from 0x0. esptool pads the gaps with 0xFF,
+    #    which covers NVS (0x9000), so writing it ERASES SETTINGS. Production only.
     esptool = env.subst("$UPLOADER").strip('"')
     cmd = [
         esptool, "--chip", env.BoardConfig().get("build.mcu", "esp32c3"),
@@ -69,20 +74,39 @@ def make_release(source, target, env):
         "--flash-mode", env.subst("${__get_board_flash_mode(__env__)}"),
         "--flash-freq", env.subst("${__get_board_f_image(__env__)}"),
         "--flash-size", env.BoardConfig().get("upload.flash_size", "4MB"),
-    ] + parts
+    ]
+    for offset, image in pieces:
+        cmd += [offset, image]
     print("[release] " + " ".join(cmd))
     subprocess.check_call(cmd)
     shutil.copyfile(app, app_out)
+
+    # 2) Web flasher: the same pieces as separate parts at their own offsets, so the
+    #    NVS range is never written and settings survive a reinstall. The flasher's
+    #    "erase device" option (chip erase) is the only way it wipes settings.
+    #    Each piece is sliced out of the factory image rather than copied from the build
+    #    dir, because merge-bin patches the bootloader header (flash mode/freq/size) and
+    #    the web flasher writes bytes as-is.
+    with open(factory, "rb") as f:
+        merged = f.read()
+    web_parts = []
+    for offset, image in pieces:
+        off = int(offset, 0)
+        if image == app:
+            name = app_name
+        else:
+            stem = os.path.splitext(os.path.basename(image))[0]
+            name = f"{slug}-{ver_tag}-{stem}.bin"
+            with open(os.path.join(fw_dir, name), "wb") as f:
+                f.write(merged[off:off + os.path.getsize(image)])
+        web_parts.append({"path": f"firmware/{name}", "offset": off})
 
     with open(os.path.join(web, "manifest.json"), "w", encoding="utf-8") as f:
         json.dump({
             "name": product,
             "version": version,
             "new_install_prompt_erase": True,
-            "builds": [{
-                "chipFamily": "ESP32-C3",
-                "parts": [{"path": f"firmware/{factory_name}", "offset": 0}],
-            }],
+            "builds": [{"chipFamily": "ESP32-C3", "parts": web_parts}],
         }, f, indent=2)
 
     with open(os.path.join(fw_dir, "ota.json"), "w", encoding="utf-8") as f:

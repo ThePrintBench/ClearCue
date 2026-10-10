@@ -46,6 +46,8 @@ Pick one:
 - **PlatformIO**: `pio run -t upload` (see *Building* below).
 - **Production / many boards**: `tools/batch_flash.ps1` flashes each board you plug in and logs its MAC address and setup-network name to a CSV.
 
+Each build produces two kinds of image. `clearcue-<ver>-factory.bin` is everything merged into one file written at `0x0`. It overwrites the settings area, so use it only for production or a deliberate factory reset (`batch_flash.ps1` uses it). The web flasher instead writes the bootloader, partition table, OTA data and `clearcue-<ver>-app.bin` as separate pieces at their own offsets, so a reinstall keeps settings unless you tick **Erase device**. `clearcue-<ver>-app.bin` alone is what OTA and the settings-page upload use.
+
 If the board doesn't show up over USB, hold **BOOT** while plugging it in.
 
 ## Setting it up
@@ -94,7 +96,7 @@ For HTTPS: open **HTTPS certificate check → Trust this server**, compare the f
 Requirements: VS Code with the **pioarduino** extension (not upstream PlatformIO), and **Git** on your PATH (the build fetches wolfSSL).
 
 ```bash
-pio run                 # build -> web/manifest.json + web/firmware/clearcue-<ver>-{factory,app}.bin
+pio run                 # build -> web/manifest.json + web/firmware/clearcue-<ver>-*.bin
 pio run -t upload       # flash over USB
 pio device monitor      # serial log (enable debug logging on the settings page first)
 ```

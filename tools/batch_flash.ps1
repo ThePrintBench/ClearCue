@@ -6,7 +6,7 @@
     pio run -e clearcue                     # builds + writes web/firmware/*-factory.bin
     powershell -ExecutionPolicy Bypass -File tools\batch_flash.ps1
   Options:
-    -Firmware <path>   default: the factory image web\manifest.json points at (current build)
+    -Firmware <path>   default: the factory image matching web\manifest.json (current build)
     -Log <path>        default: tools\flash_log.csv
     -Baud <n>          default: 921600 (native USB ignores it anyway)
     -NoErase           keep NVS (only for re-flashing your own configured boards)
@@ -24,7 +24,10 @@ if (-not (Test-Path $manifestPath)) { throw "No web\manifest.json. Run: pio run 
 $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
 if (-not $Firmware) {
   # Versioned file names: flash exactly the image the current manifest names.
-  $Firmware = Join-Path (Join-Path $root "web") ($manifest.builds[0].parts[0].path -replace '/', '\')
+  # The manifest lists separate parts for the web flasher; production uses the merged factory image.
+  $appPart = ($manifest.builds[0].parts | Where-Object { $_.path -like '*-app.bin' } | Select-Object -First 1).path
+  if (-not $appPart) { throw "No app part in web\manifest.json. Rebuild: pio run -e clearcue" }
+  $Firmware = Join-Path (Join-Path $root "web") (($appPart -replace '-app\.bin$', '-factory.bin') -replace '/', '\')
 }
 if (-not (Test-Path $Firmware)) { throw "Factory image not found: $Firmware. Run: pio run -e clearcue" }
 if (-not $Log) { $Log = Join-Path $PSScriptRoot "flash_log.csv" }
