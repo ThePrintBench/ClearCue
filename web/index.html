@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Button Installer</title>
+<!-- Customer-facing flasher. Host this folder (index.html, manifest.json, firmware/) on any
+     static HTTPS host. Web Serial needs HTTPS (or localhost) and desktop Chrome/Edge. -->
+<script type="module" src="https://unpkg.com/esp-web-tools@10.4.0/dist/web/install-button.js?module"></script>
+<style>
+:root{--bg:#f6f6f4;--card:#fff;--fg:#1d1d1b;--mute:#66655f;--line:#e2e1dc;--acc:#2f6f4f}
+@media (prefers-color-scheme:dark){:root{--bg:#161615;--card:#1f1f1d;--fg:#ecebe6;--mute:#9a9992;--line:#33322f;--acc:#5fb98a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.55 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:680px;margin:0 auto;padding:32px 16px 64px}
+h1{font-size:28px;line-height:1.2;margin:0 0 6px}
+.lede{color:var(--mute);margin:0 0 24px}
+section{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;margin:16px 0}
+h2{font-size:17px;margin:0 0 10px}
+ol{padding-left:20px;margin:8px 0}li{margin:6px 0}
+.install{display:flex;justify-content:center;padding:12px 0 4px}
+esp-web-install-button{--esp-tools-button-color:var(--acc);--esp-tools-button-border-radius:8px}
+.note{font-size:14px;color:var(--mute)}
+code{font:14px ui-monospace,monospace;background:var(--bg);border:1px solid var(--line);border-radius:5px;padding:1px 5px}
+details{margin-top:8px}summary{cursor:pointer;font-weight:600}
+.warn{display:none;border-left:3px solid #b23a2e;padding-left:12px}
+</style>
+</head>
+<body>
+<main>
+  <h1>Set up your button</h1>
+  <p class="lede">Your button comes ready to go. Use this page to set it up from a computer, reinstall the firmware, or update it.</p>
+
+  <section>
+    <h2>Set up from a computer (easiest)</h2>
+    <ol>
+      <li>Plug the button into your computer with a USB-C <b>data</b> cable. Some charge-only cables won't work.</li>
+      <li>Click <b>Connect</b> below and pick the port that appears. It's usually "USB JTAG/serial debug unit".</li>
+      <li>Enter your 2.4 GHz Wi-Fi network and password when asked.</li>
+      <li>Click <b>Visit device</b> to open the button's settings page, then fill in your printer server details.</li>
+    </ol>
+    <div class="install">
+      <esp-web-install-button manifest="manifest.json">
+        <button slot="activate" style="font:inherit;font-weight:600;padding:12px 22px;border-radius:8px;border:0;background:var(--acc);color:#fff;cursor:pointer">Connect</button>
+        <span slot="unsupported"><p class="warn" style="display:block">This browser can't talk to USB devices. Use Chrome or Edge on a Windows, Mac, or Linux computer, or use the phone setup below.</p></span>
+        <span slot="not-allowed"><p class="warn" style="display:block">This page has to be opened over HTTPS to connect.</p></span>
+      </esp-web-install-button>
+    </div>
+    <p class="note">You'll also see options to reinstall or update the firmware. Reinstalling with "erase" clears all settings.</p>
+  </section>
+
+  <section>
+    <h2>Set up with a phone and a computer</h2>
+    <ol>
+      <li>Power the button from any USB charger. When it isn't set up yet, it glows blue.</li>
+      <li>On your phone, join the Wi-Fi network named like <code>ClearCue-1A2B</code>.</li>
+      <li>The setup page should open on its own. If it doesn't, go to <code>http://192.168.4.1</code>.</li>
+      <li>Pick your Wi-Fi network, enter its password and tap <b>Connect</b>. The phone then shows the button's address, like <code>http://clearcue-1a2b.local</code>.</li>
+      <li>On a computer on the same Wi-Fi, open that address and fill in your printer server details. The light blinks blue slowly until you do.</li>
+    </ol>
+    <p class="note">No computer? On the phone's setup page, tap "Set up everything on this phone instead".</p>
+  </section>
+
+  <section>
+    <h2>What the lights mean</h2>
+    <ol style="list-style:none;padding:0">
+      <li><b>Solid green</b>: the printer is ready, nothing to do.</li>
+      <li><b>Solid red</b>: the printer is busy, or the plate needs clearing. Press once you've cleared it.</li>
+      <li><b>Solid blue</b>: setup mode. The button's own setup Wi-Fi network is on. It also comes on if the button loses your Wi-Fi for more than 5 minutes.</li>
+      <li><b>Slow blue blinking</b>: on your Wi-Fi, but the printer server details still need filling in on the settings page.</li>
+      <li><b>Fast red/green alternating</b>: connecting to Wi-Fi.</li>
+      <li><b>Slow red blinking</b>: can't reach your printer server. Open the settings page and click <b>Test connection</b>.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Troubleshooting</h2>
+    <details><summary>The Connect button doesn't find my button</summary>
+      <p>Try a different USB cable or port. If it still doesn't appear, unplug the button, hold the small <b>BOOT</b> button on the board, plug it back in, then let go and try again.</p>
+    </details>
+    <details><summary>I forgot the settings password, or want to start over</summary>
+      <p>Hold the big button for 10 seconds. The light flickers white after 3 seconds; keep holding. The button erases its settings and goes back to setup mode.</p>
+    </details>
+    <details><summary>Where's the settings page after setup?</summary>
+      <p>On the same network, open <code>http://&lt;device-name&gt;.local</code> (shown on the setup page), or the button's IP address from your router.</p>
+    </details>
+  </section>
+</main>
+</body>
+</html>

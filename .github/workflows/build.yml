@@ -1,0 +1,121 @@
+# Builds the firmware and runs the TLS host test on every push / PR.
+# On a tag like v2.4.3 it also checks the tag matches FW_VERSION and publishes a
+# GitHub Release with the flashable images, the web flasher files, and the exact
+# wolfSSL source the binary was built from (GPLv3 corresponding source).
+#
+# Optional repository variables (Settings -> Secrets and variables -> Actions -> Variables):
+#   CLEARCUE_OTA_BASE_URL  HTTPS origin hosting web/ (compiled in as the update server)
+#   CLEARCUE_SOURCE_URL    link shown on the settings page (defaults to this repo)
+#   DEPLOY_PAGES           "true" to publish web/ to GitHub Pages on tagged releases
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      CLEARCUE_OTA_BASE_URL: ${{ vars.CLEARCUE_OTA_BASE_URL }}
+      CLEARCUE_SOURCE_URL: ${{ vars.CLEARCUE_SOURCE_URL || format('{0}/{1}', github.server_url, github.repository) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Firmware version
+        id: ver
+        run: |
+          v=$(sed -n 's/^#define FW_VERSION "\(.*\)"/\1/p' src/clearcue/version.h)
+          test -n "$v" || { echo "::error::FW_VERSION not found"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/v* && "${GITHUB_REF_NAME#v}" != "$v" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match FW_VERSION $v"; exit 1
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache PlatformIO
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            .pio/deps
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini', 'tools/wolfssl_config.py') }}
+
+      - name: Install PlatformIO
+        run: pip install "platformio==6.1.19"
+
+      - name: Build
+        run: pio run -e clearcue
+
+      - name: TLS host test
+        run: |
+          sudo apt-get install -y --no-install-recommends openssl >/dev/null
+          bash test/tls_host/run.sh .pio/deps/wolfssl-v5.9.4-stable
+
+      - name: Package wolfSSL source (GPL corresponding source)
+        run: |
+          d=.pio/deps/wolfssl-v5.9.4-stable
+          echo "wolfSSL commit: $(git -C $d rev-parse HEAD)"
+          git -C $d archive --format=tar.gz --prefix=wolfssl-v5.9.4-stable/ -o "$PWD/wolfssl-v5.9.4-stable-source.tar.gz" HEAD
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clearcue-${{ steps.ver.outputs.version }}
+          path: |
+            web/
+            wolfssl-v5.9.4-stable-source.tar.gz
+          if-no-files-found: error
+
+      - name: Pages artifact
+        if: startsWith(github.ref, 'refs/tags/v') && vars.DEPLOY_PAGES == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Bundle web flasher
+        run: cd dist && zip -qr "../clearcue-${GITHUB_REF_NAME#v}-web.zip" web
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/web/firmware/*.bin
+            dist/wolfssl-v5.9.4-stable-source.tar.gz
+            clearcue-*-web.zip
+
+  pages:
+    if: startsWith(github.ref, 'refs/tags/v') && vars.DEPLOY_PAGES == 'true'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4
