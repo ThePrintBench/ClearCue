@@ -17,24 +17,31 @@
 // Backends (picked at runtime):
 //   bambuddy:   GET  {base}/printers/{id}/status          X-API-Key
 //               POST {base}/printers/{id}/clear-plate
-//               red = awaiting_plate_clear || state in {RUNNING,PREPARE,PAUSE}; armed = awaiting
+//               plate = awaiting_plate_clear; printing = state RUNNING/PREPARE/SLICING;
+//               paused = PAUSE; offline = connected/online false (if reported); armed = awaiting
 //   watchtower: GET  {base}/printers/{name}               Authorization: Bearer
 //               POST {base}/printers/{name}/commands {"command":"set_ready"}
-//               red = !(ready && online); armed = online && !busy && !ready
+//               ready = ready && online; offline = !online; printing = busy (paused/error if a
+//               status/state string says so); plate = online && !busy && !ready (armed)
 //
 // HTTPS to the printer server uses wolfSSL (tls_client.*), which handles Watchtower's
 // name-constrained local CA. Optional CA pin + host/IP check; "Trust this server" on the
 // settings page pins the server's CA by fingerprint. OTA stays on mbedTLS.
 //
-// LED patterns:
-//   solid red/green          normal status
+// LED patterns (PWM, rendered by their own task so they stay smooth during HTTPS polls):
+//   solid green              ready for the next job
+//   solid red                plate waiting to be cleared: press to confirm
+//   slow red breathing       printing / preparing
+//   fast red blink           paused or printer error
+//   solid amber              printer offline (server reachable)
+//   slow amber blink         3+ failed checks in a row (server unreachable / auth / etc.)
 //   solid blue               setup network (AP) is up: first setup, or Wi-Fi lost >5 min
 //   slow blue blink          on Wi-Fi, but printer-server settings not filled in yet
 //   fast red/green alternate joining Wi-Fi
-//   slow red blink           3+ failed checks in a row (server unreachable / auth / etc.)
+//   red -> green -> blue     identify (from the settings page); a press just stops it
 //   fast white flicker       button held >3 s: release to cancel, keep holding to 10 s to factory reset
 //
-// Button: short press (<1.5 s) = action. Hold 10 s = factory reset.
+// Button: short press (<1.5 s) = action (or stop identify). Hold 10 s = factory reset.
 // ===============================================================================
 
 #include <Arduino.h>
@@ -137,6 +144,7 @@ const uint8_t  FAIL_STREAK_ERROR   = 3;
 struct Config {
   String ssid, pass, backend, apiBase, apiKey, printer, hostname, caCert, adminPass, otaUrl;
   uint32_t pollSec = 10;
+  uint8_t  brightness = 100;       // LED brightness, percent (5-100)
   bool     debug = false;          // serial debug logging
   bool hasWifi() const { return ssid.length() > 0; }
   bool configured() const {
@@ -150,10 +158,17 @@ Preferences prefs;
 static const char* NVS_NS = "btncfg";
 
 // ---------------- Runtime state ----------------
+// What the printer is doing, as far as the LED is concerned.
+enum PrinterState : uint8_t { PS_READY, PS_PLATE, PS_PRINTING, PS_PAUSED, PS_OFFLINE };
+const char* printerStateName(uint8_t s) {
+  static const char* n[] = {"ready", "plate", "printing", "paused", "offline"};
+  return s < 5 ? n[s] : "unknown";
+}
 struct PollResult {
   bool     ok = false;
   bool     red = true;
   bool     armed = false;
+  uint8_t  state = PS_PLATE;
   int      http = 0;
   String   url, transport, tls, body, summary, hint;
   uint32_t at = 0;
@@ -188,6 +203,7 @@ PollResult last;
 bool       haveStatus = false;
 bool       showRed = true;
 bool       armed = false;
+volatile uint8_t printerState = PS_PLATE;
 uint8_t    failStreak = 0;
 uint32_t   lastPoll = 0;
 uint32_t   pollDelay = 10000;
@@ -205,14 +221,69 @@ bool     btnHeld = false;
 // ===================================================================
 // Helpers
 // ===================================================================
-void setLed(int pin, bool on) { digitalWrite(pin, LED_ACTIVE_LOW ? !on : on); }
-void leds(bool red, bool green, bool blue = false) {
-  setLed(LED_RED_PIN, red); setLed(LED_GREEN_PIN, green); setLed(LED_BLUE_PIN, blue);
+// ---------------- LED engine ----------------
+enum LedMode : uint8_t { LM_NONE, LM_FACTORY_RESET, LM_RESET_WARN, LM_FLASH, LM_IDENTIFY, LM_SETUP_AP,
+                         LM_JOINING, LM_NEEDS_SETTINGS, LM_ERROR, LM_READY, LM_PLATE, LM_PRINTING,
+                         LM_PAUSED, LM_OFFLINE };
+// The LEDs are driven by LEDC PWM from a small task of their own, so breathing and blink
+// patterns keep running while loop() is blocked in an HTTPS poll. loop() only sets the
+// state variables below; ledTask() turns them into colours.
+struct Rgb { uint8_t r, g, b; };
+const Rgb C_OFF{0, 0, 0}, C_RED{255, 0, 0}, C_GREEN{0, 255, 0}, C_BLUE{0, 0, 255},
+          C_WHITE{255, 255, 255};
+// Amber = full red + this much green (0-255, linear light). Adjustable at runtime from the
+// Light test section (not saved) so it can be tuned by eye, then baked in here.
+const uint8_t AMBER_GREEN_DEFAULT = 145;   // set by eye on the real button (Oct 2026)
+volatile uint8_t amberGreen = AMBER_GREEN_DEFAULT;
+Rgb amber() { return Rgb{255, amberGreen, 0}; }
+// Per-channel scale to balance the three dies (blue is the weakest at 3.3 V).
+const float LED_SCALE_R = 1.0f, LED_SCALE_G = 1.0f, LED_SCALE_B = 1.0f;
+const uint32_t LED_PWM_HZ   = 5000;     // well above flicker, no banding on phone video
+const uint8_t  LED_PWM_BITS = 10;
+const uint32_t LED_PWM_MAX  = (1u << LED_PWM_BITS) - 1;
+const uint32_t BREATHE_MS   = 3000;     // printing: one full breath
+const uint32_t IDENTIFY_MS  = 15000;    // default identify duration
+const uint32_t IDENTIFY_STEP_MS = 400;  // red -> green -> blue, this long each
+
+volatile uint32_t identifyUntil = 0;    // millis() deadline; 0 = off
+volatile uint32_t previewUntil = 0;     // light test from the settings page: deadline, 0 = off
+volatile uint8_t  previewMode = 0;      // LedMode to show while previewUntil is in the future
+volatile bool     ledFactoryReset = false;
+volatile bool     ledImprovJoining = false;
+// A short feedback flash (button press results). Written by loop(), read by the task.
+volatile uint32_t flashStart = 0, flashEnd = 0, flashHalfMs = 80;
+volatile uint8_t  flashColor = 0;       // 0 red, 1 green, 2 blue
+bool ledsReady = false;
+// Snapshots taken by loop() each pass, so the LED task never touches cfg's Strings or
+// Wi-Fi internals while loop() may be changing them.
+volatile bool ledWifiUp = false, ledConfigured = false;
+
+bool identifying() { return identifyUntil && (int32_t)(identifyUntil - millis()) > 0; }
+bool previewing()  { return previewUntil && (int32_t)(previewUntil - millis()) > 0; }
+
+// Gamma (2.2) is applied to the overall level (brightness x pattern) only; the colour mix is
+// applied linearly on top, so a mixed colour like amber keeps its hue at every level instead
+// of the weaker channel vanishing when dimmed.
+void writeChannel(int pin, float mix, float gain) {
+  uint32_t duty = (uint32_t)lroundf(constrain(mix * gain, 0.0f, 1.0f) * LED_PWM_MAX);
+  ledcWrite(pin, LED_ACTIVE_LOW ? LED_PWM_MAX - duty : duty);
+}
+void showColor(Rgb c, float level = 1.0f) {
+  if (!ledsReady) return;
+  float gain = powf(constrain(level * (cfg.brightness / 100.0f), 0.0f, 1.0f), 2.2f);
+  writeChannel(LED_RED_PIN,   c.r / 255.0f * LED_SCALE_R, gain);
+  writeChannel(LED_GREEN_PIN, c.g / 255.0f * LED_SCALE_G, gain);
+  writeChannel(LED_BLUE_PIN,  c.b / 255.0f * LED_SCALE_B, gain);
 }
 
+// Feedback blinks keep their old blocking behaviour (the caller waits for them to finish),
+// but are drawn by the LED task.
 void blink(int pin, int times, int ms) {
-  leds(false, false, false);
-  for (int i = 0; i < times; i++) { setLed(pin, true); delay(ms); setLed(pin, false); delay(ms); }
+  flashColor = pin == LED_RED_PIN ? 0 : pin == LED_GREEN_PIN ? 1 : 2;
+  flashHalfMs = ms;
+  flashStart = millis();
+  flashEnd = flashStart + (uint32_t)times * 2 * ms;
+  delay((uint32_t)times * 2 * ms);
 }
 
 // Why the chip last restarted. A button press showing up here as BROWNOUT or POWERON
@@ -298,11 +369,13 @@ void loadConfig() {
   cfg.otaUrl    = prefs.getString("otaUrl", "");
   cfg.pollSec   = prefs.getUInt("pollSec", 10);
   cfg.debug     = prefs.getBool("debug", false);
+  cfg.brightness = prefs.getUChar("bright", 100);
   prefs.end();
   if (cfg.backend != "bambuddy") cfg.backend = "watchtower";
   if (!cfg.hostname.length()) cfg.hostname = defaultHostname();
   if (!cfg.otaUrl.length()) cfg.otaUrl = DEFAULT_OTA_URL;
   cfg.pollSec = constrain(cfg.pollSec, 5u, 300u);
+  cfg.brightness = constrain(cfg.brightness, (uint8_t)5, (uint8_t)100);
 }
 
 void saveConfig() {
@@ -319,13 +392,15 @@ void saveConfig() {
   prefs.putString("otaUrl", cfg.otaUrl == DEFAULT_OTA_URL ? "" : cfg.otaUrl);
   prefs.putUInt("pollSec", cfg.pollSec);
   prefs.putBool("debug", cfg.debug);
+  prefs.putUChar("bright", cfg.brightness);
   prefs.end();
 }
 
 [[noreturn]] void factoryReset() {
   DBG("[reset] erasing settings\n");
   prefs.begin(NVS_NS, false); prefs.clear(); prefs.end();
-  for (int i = 0; i < 6; i++) { leds(true, true, true); delay(100); leds(false, false, false); delay(100); }
+  ledFactoryReset = true;               // white flashes, drawn by the LED task
+  delay(1200);
   ESP.restart();
   while (true) {}
 }
@@ -431,7 +506,20 @@ void logPollBodyIfChanged(const String& body) {
 
 bool isBusyState(String v) {
   v.toUpperCase();
-  return v == "RUNNING" || v == "PREPARE" || v == "PAUSE";
+  return v == "RUNNING" || v == "PREPARE" || v == "PAUSE" || v == "SLICING";
+}
+
+// Watchtower doesn't document a paused/error field we rely on, so look at whichever
+// status-like strings the response carries and only use them to refine "busy".
+bool wtLooksPausedOrError(JsonObject d) {
+  for (const char* k : {"status", "state", "print_state", "printStatus", "job_status", "gcode_state"}) {
+    if (!d[k].is<const char*>()) continue;
+    String v = d[k].as<const char*>();
+    v.toUpperCase();
+    if (v.indexOf("PAUSE") >= 0 || v.indexOf("ERROR") >= 0 || v.indexOf("FAULT") >= 0 || v.indexOf("HALT") >= 0)
+      return true;
+  }
+  return false;
 }
 
 PollResult pollOnce() {
@@ -487,6 +575,8 @@ PollResult pollOnce() {
     bool ready = d["ready"] | false, busy = d["busy"] | false, online = d["online"] | false;
     r.red   = !(ready && online);
     r.armed = online && !busy && !ready;
+    r.state = !online ? PS_OFFLINE : busy ? (wtLooksPausedOrError(d) ? PS_PAUSED : PS_PRINTING)
+            : ready ? PS_READY : PS_PLATE;
     r.summary = String("ready=") + ready + " busy=" + busy + " online=" + online;
     if (!online) r.summary += " (Watchtower reports the printer offline: button disabled)";
   } else {
@@ -496,20 +586,26 @@ PollResult pollOnce() {
     logPollBodyIfChanged(body);
     bool awaiting = doc["awaiting_plate_clear"] | false;
     const char* state = doc["state"] | "";
-    r.red   = awaiting || isBusyState(state);
+    String st = state; st.toUpperCase();
+    // Only trust an explicit "not connected" flag; absent means connected.
+    bool offline = (doc["connected"].is<bool>() && !doc["connected"].as<bool>()) ||
+                   (doc["online"].is<bool>() && !doc["online"].as<bool>()) || st == "OFFLINE";
+    r.red   = awaiting || isBusyState(state) || offline;
     r.armed = awaiting;
+    r.state = awaiting ? PS_PLATE : offline ? PS_OFFLINE : st == "PAUSE" ? PS_PAUSED
+            : isBusyState(state) ? PS_PRINTING : PS_READY;
     r.summary = String("state=") + state + " awaiting_plate_clear=" + awaiting;
   }
   r.ok = true;
   r.hint = "Connected. The button is talking to the printer server.";
-  DBG("[poll] ok %s -> red=%d armed=%d\n", r.summary.c_str(), r.red, r.armed);
+  DBG("[poll] ok %s -> %s, armed=%d\n", r.summary.c_str(), printerStateName(r.state), r.armed);
   return r;
 }
 
 void applyPoll(const PollResult& r) {
   last = r;
   haveStatus = true;
-  if (r.ok) { showRed = r.red; armed = r.armed; failStreak = 0; }
+  if (r.ok) { showRed = r.red; armed = r.armed; printerState = r.state; failStreak = 0; }
   else if (failStreak < 255) failStreak++;
 }
 
@@ -536,6 +632,11 @@ int sendAction() {
 }
 
 void onShortPress() {
+  if (identifying() || previewing()) {   // someone found the button / is testing: stop, don't act
+    identifyUntil = 0; previewUntil = 0;
+    DBG("[button] short press: identify / light test stopped\n");
+    return;
+  }
   bool up = WiFi.status() == WL_CONNECTED;
   DBG("[button] short press: configured=%d wifi=%d failStreak=%u armed=%d showRed=%d\n",
       cfg.configured(), up, failStreak, armed, showRed);
@@ -559,7 +660,7 @@ void onShortPress() {
   int code = sendAction();
   if (code >= 200 && code < 300) {
     DBG("[button] -> accepted (3x green blink)\n");
-    showRed = false; armed = false;                         // optimistic; next poll confirms
+    showRed = false; armed = false; printerState = PS_READY;  // optimistic; next poll confirms
     blink(LED_GREEN_PIN, 3, 80);
     lastPoll = millis();                                    // give the server a beat
   } else {
@@ -697,9 +798,9 @@ bool tryCredentials(const String& ssid, const String& pass) {
   WiFi.disconnect(false);
   WiFi.begin(ssid.c_str(), pass.c_str());
   uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) {
-    leds(true, false); delay(150); leds(false, true); delay(150);
-  }
+  ledImprovJoining = true;
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 20000) delay(50);
+  ledImprovJoining = false;
   if (WiFi.status() == WL_CONNECTED) {
     cfg.ssid = ssid; cfg.pass = pass;
     saveConfig();
@@ -740,6 +841,7 @@ void fillPoll(JsonObject p, const PollResult& r) {
   p["ok"] = r.ok; p["red"] = r.red; p["http"] = r.http; p["url"] = r.url;
   p["transport"] = r.transport; p["tls"] = r.tls; p["body"] = r.body;
   p["summary"] = r.summary; p["hint"] = r.hint;
+  p["state"] = r.ok ? printerStateName(r.state) : "";
   p["age"] = haveStatus ? (int32_t)((millis() - r.at) / 1000) : -1;
 }
 
@@ -755,6 +857,8 @@ void handleInfo() {
   d["ip"] = up ? WiFi.localIP().toString() : "";
   d["configured"] = cfg.configured();
   d["uptime"] = millis() / 1000;
+  d["identify"] = identifying() ? (int32_t)((identifyUntil - millis() + 999) / 1000) : 0;
+  d["lightTest"] = previewing() ? (int32_t)((previewUntil - millis() + 999) / 1000) : 0;
   if (haveStatus) fillPoll(d["poll"].to<JsonObject>(), last);
   sendJson(d);
 }
@@ -770,6 +874,7 @@ void handleGetConfig() {
   d["hasAdmin"] = cfg.adminPass.length() > 0;
   d["debug"] = cfg.debug;
   d["debugAvailable"] = (bool)DEBUG;
+  d["brightness"] = cfg.brightness;
   d["otaUrl"] = cfg.otaUrl;
   sendJson(d);
 }
@@ -830,6 +935,7 @@ void handlePostConfig() {
     cfg.hostname = h.length() ? h : defaultHostname();
   }
   if (!in["pollSec"].isNull()) cfg.pollSec = constrain(in["pollSec"].as<uint32_t>(), 5u, 300u);
+  if (!in["brightness"].isNull()) cfg.brightness = constrain(in["brightness"].as<int>(), 5, 100);
   if (str("adminPass").length()) cfg.adminPass = str("adminPass");
   bool debugWas = cfg.debug;
   if (in["debug"].is<bool>()) cfg.debug = in["debug"].as<bool>();
@@ -850,7 +956,7 @@ void handlePostConfig() {
   pollNowFlag = true;
 
   bool reboot = cfg.ssid != oldSsid || cfg.pass != oldPass || cfg.hostname != oldHost ||
-                (apActive && WiFi.status() != WL_CONNECTED);
+                (apActive && WiFi.status() != WL_CONNECTED && in["ssid"].is<const char*>());
   JsonDocument d; d["ok"] = true; d["reboot"] = reboot;
   sendJson(d);
   if (reboot) { rebootPending = true; rebootAt = millis() + 1500; }
@@ -1083,6 +1189,53 @@ void handleApClose() {
   apClosePending = true; apCloseAt = millis() + 1500;
 }
 
+// POST /api/identify {"seconds":15} -> cycle red/green/blue so the button can be found.
+// {"seconds":0} stops it. A short press on the button also stops it.
+void handleIdentify() {
+  if (!authorized()) return;
+  JsonDocument in; deserializeJson(in, server.arg("plain"));
+  int sec = in["seconds"].isNull() ? (int)(IDENTIFY_MS / 1000) : constrain(in["seconds"].as<int>(), 0, 300);
+  identifyUntil = sec ? millis() + (uint32_t)sec * 1000 : 0;
+  DBG("[identify] %s\n", sec ? (String("for ") + sec + " s").c_str() : "stopped");
+  JsonDocument d; d["ok"] = true; d["seconds"] = sec;
+  sendJson(d);
+}
+
+// POST /api/ledtest {"mode":"printing","seconds":20} -> show that light pattern without
+// touching the printer server (polling carries on, but the pattern overrides it; a press
+// only stops the test). {"mode":"stop"} ends it. Feedback modes ("accepted", "nothing",
+// "failed") play the button-press blinks once.
+void handleLedTest() {
+  if (!authorized()) return;
+  JsonDocument in; deserializeJson(in, server.arg("plain"));
+  String m = in["mode"] | "stop";
+  if (!in["amberGreen"].isNull()) amberGreen = constrain(in["amberGreen"].as<int>(), 0, 255);
+  int sec = in["seconds"].isNull() ? 20 : constrain(in["seconds"].as<int>(), 1, 300);
+  static const struct { const char* name; LedMode mode; } modes[] = {
+    {"ready", LM_READY}, {"plate", LM_PLATE}, {"printing", LM_PRINTING}, {"paused", LM_PAUSED},
+    {"offline", LM_OFFLINE}, {"error", LM_ERROR}, {"setup", LM_SETUP_AP}, {"settings", LM_NEEDS_SETTINGS},
+    {"joining", LM_JOINING}, {"identify", LM_IDENTIFY}, {"resetwarn", LM_RESET_WARN}};
+  JsonDocument d; d["ok"] = true; d["amberGreen"] = amberGreen;
+  if (m == "stop") { previewUntil = 0; d["mode"] = "stop"; sendJson(d); DBG("[ledtest] stopped\n"); return; }
+  if (m == "accepted" || m == "nothing" || m == "failed") {
+    previewUntil = 0;
+    d["mode"] = m; sendJson(d);
+    DBG("[ledtest] feedback: %s\n", m.c_str());
+    if (m == "accepted") blink(LED_GREEN_PIN, 3, 80);
+    else if (m == "nothing") blink(LED_GREEN_PIN, 2, 60);
+    else blink(LED_RED_PIN, 3, 80);
+    return;
+  }
+  for (auto& e : modes) if (m == e.name) {
+    previewMode = e.mode;
+    previewUntil = millis() + (uint32_t)sec * 1000;
+    d["mode"] = m; d["seconds"] = sec; sendJson(d);
+    DBG("[ledtest] %s for %d s\n", m.c_str(), sec);
+    return;
+  }
+  sendErr("Unknown pattern");
+}
+
 void setupServer() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/api/info", HTTP_GET, handleInfo);
@@ -1095,6 +1248,8 @@ void setupServer() {
   server.on("/api/wifi", HTTP_GET, handleWifiGet);
   server.on("/api/ap/close", HTTP_POST, handleApClose);
   server.on("/api/ota", HTTP_POST, handleOta);
+  server.on("/api/identify", HTTP_POST, handleIdentify);
+  server.on("/api/ledtest", HTTP_POST, handleLedTest);
   server.on("/api/reboot", HTTP_POST, [] {
     if (!authorized()) return;
     sendOk(); rebootPending = true; rebootAt = millis() + 500;
@@ -1111,29 +1266,89 @@ void setupServer() {
 // ===================================================================
 // LEDs + button
 // ===================================================================
-enum LedMode : uint8_t { LM_NONE, LM_RESET_WARN, LM_SETUP_AP, LM_JOINING, LM_NEEDS_SETTINGS,
-                         LM_ERROR, LM_RED, LM_GREEN };
+
+
+LedMode currentLedMode() {
+  uint32_t t = millis();
+  if (ledFactoryReset)                                return LM_FACTORY_RESET;
+  if (btnHeld && t - btnDownAt > RESET_WARN_MS)       return LM_RESET_WARN;
+  if ((int32_t)(flashEnd - t) > 0)                    return LM_FLASH;
+  if (previewing())                                   return (LedMode)previewMode;
+  if (identifying())                                  return LM_IDENTIFY;
+  if (ledImprovJoining)                               return LM_JOINING;
+  bool up = ledWifiUp, conf = ledConfigured;
+  // AP mode is blue, unless Wi-Fi is up and fully configured (the AP is then about to close).
+  if (apActive && !(up && conf))                      return LM_SETUP_AP;
+  if (!up)                                            return LM_JOINING;
+  if (!conf)                                          return LM_NEEDS_SETTINGS;
+  if (failStreak >= FAIL_STREAK_ERROR)                return LM_ERROR;
+  switch (printerState) {
+    case PS_READY:    return LM_READY;
+    case PS_PRINTING: return LM_PRINTING;
+    case PS_PAUSED:   return LM_PAUSED;
+    case PS_OFFLINE:  return LM_OFFLINE;
+    default:          return LM_PLATE;
+  }
+}
+
 void logLedMode(LedMode m) {
   static LedMode prev = LM_NONE;
-  if (m == prev) return;
+  if (m == prev || m == LM_FLASH) return;
   prev = m;
-  static const char* names[] = {"", "white flicker (reset warning)", "solid blue (setup network)",
-      "red/green alternating (joining Wi-Fi)", "slow blue blink (needs server settings)",
-      "slow red blink (server unreachable)", "solid red", "solid green"};
+  static const char* names[] = {"", "white flashes (factory reset)", "white flicker (reset warning)", "",
+      "red/green/blue cycle (identify)", "solid blue (setup network)", "red/green alternating (joining Wi-Fi)",
+      "slow blue blink (needs server settings)", "slow amber blink (server unreachable)",
+      "solid green (ready)", "solid red (plate waiting)", "red breathing (printing)",
+      "fast red blink (paused / error)", "solid amber (printer offline)"};
   DBG("[led] %s\n", names[m]);
 }
 
-void updateLeds() {
+// One frame. Called every 20 ms from ledTask().
+void renderLeds() {
   uint32_t t = millis();
-  if (btnHeld && t - btnDownAt > RESET_WARN_MS) { logLedMode(LM_RESET_WARN); bool on = (t / 80) % 2; leds(on, on, on); return; }
-  bool up = WiFi.status() == WL_CONNECTED;
-  // AP mode is blue, unless Wi-Fi is up and fully configured (the AP is then about to close).
-  if (apActive && !(up && cfg.configured())) { logLedMode(LM_SETUP_AP); leds(false, false, true); return; }
-  if (!up)                          { logLedMode(LM_JOINING); bool p = (t / 150) % 2; leds(p, !p); return; }
-  if (!cfg.configured())            { logLedMode(LM_NEEDS_SETTINGS); leds(false, false, (t / 600) % 2); return; }
-  if (failStreak >= FAIL_STREAK_ERROR) { logLedMode(LM_ERROR); leds((t / 500) % 2, false); return; }
-  logLedMode(showRed ? LM_RED : LM_GREEN);
-  leds(showRed, !showRed);
+  switch (currentLedMode()) {
+    case LM_FACTORY_RESET: showColor((t / 100) % 2 ? C_WHITE : C_OFF); break;
+    case LM_RESET_WARN:    showColor((t / 80) % 2 ? C_WHITE : C_OFF); break;
+    case LM_FLASH: {
+      bool on = ((t - flashStart) / flashHalfMs) % 2 == 0;
+      Rgb c = flashColor == 0 ? C_RED : flashColor == 1 ? C_GREEN : C_BLUE;
+      showColor(on ? c : C_OFF);
+      break;
+    }
+    case LM_IDENTIFY: {
+      uint32_t step = (t / IDENTIFY_STEP_MS) % 3;
+      showColor(step == 0 ? C_RED : step == 1 ? C_GREEN : C_BLUE);
+      break;
+    }
+    case LM_SETUP_AP:       showColor(C_BLUE); break;
+    case LM_JOINING:        showColor((t / 150) % 2 ? C_RED : C_GREEN); break;
+    case LM_NEEDS_SETTINGS: showColor((t / 600) % 2 ? C_BLUE : C_OFF); break;
+    case LM_ERROR:          showColor((t / 500) % 2 ? amber() : C_OFF); break;
+    case LM_READY:          showColor(C_GREEN); break;
+    case LM_PLATE:          showColor(C_RED); break;
+    case LM_PRINTING: {
+      float ph = (t % BREATHE_MS) / (float)BREATHE_MS;
+      showColor(C_RED, 0.06f + 0.94f * (0.5f - 0.5f * cosf(2.0f * (float)M_PI * ph)));
+      break;
+    }
+    case LM_PAUSED:         showColor((t / 250) % 2 ? C_RED : C_OFF); break;
+    case LM_OFFLINE:        showColor(amber()); break;
+    default:                showColor(C_OFF); break;
+  }
+}
+
+void ledTask(void*) {
+  for (;;) { renderLeds(); vTaskDelay(pdMS_TO_TICKS(20)); }
+}
+
+void setupLeds() {
+  for (int pin : {LED_RED_PIN, LED_GREEN_PIN, LED_BLUE_PIN}) {
+    ledcAttach(pin, LED_PWM_HZ, LED_PWM_BITS);
+    ledcWrite(pin, LED_ACTIVE_LOW ? LED_PWM_MAX : 0);    // off
+  }
+  ledsReady = true;
+  // Above loop()'s priority so it keeps drawing while loop() is busy in a TLS handshake.
+  xTaskCreate(ledTask, "leds", 3072, nullptr, 2, nullptr);
 }
 
 void buttonLoop() {
@@ -1166,10 +1381,7 @@ void buttonLoop() {
 // setup / loop
 // ===================================================================
 void setup() {
-  pinMode(LED_RED_PIN, OUTPUT);
-  pinMode(LED_GREEN_PIN, OUTPUT);
-  pinMode(LED_BLUE_PIN, OUTPUT);
-  leds(false, false, false);
+  setupLeds();
   pinMode(BUTTON_PIN, INPUT_PULLUP);
 
   Serial.setTxBufferSize(4096);      // log bursts (TLS errors, bodies) without dropping lines
@@ -1227,6 +1439,8 @@ void loop() {
   server.handleClient();
   buttonLoop();
 
+  ledWifiUp = WiFi.status() == WL_CONNECTED;
+  ledConfigured = cfg.configured();
   if (WiFi.status() == WL_CONNECTED && cfg.configured() && !btnHeld &&
       (pollNowFlag || millis() - lastPoll >= pollDelay)) {
     pollNowFlag = false;
@@ -1237,6 +1451,8 @@ void loop() {
   if (pendingOtaUrl.length()) runPendingOta();
   if (rebootPending && (int32_t)(millis() - rebootAt) >= 0) ESP.restart();
 
-  updateLeds();
+  ledWifiUp = WiFi.status() == WL_CONNECTED;
+  ledConfigured = cfg.configured();
+  logLedMode(currentLedMode());
   delay(2);
 }

@@ -36,7 +36,7 @@ Common (PIN6)  ->   3V3
 
 Check your button's datasheet: on tri-colour buttons the blue LED is usually PIN3, shifting the others right compared with the bi-colour version, but sellers vary.
 
-**Blue at 3.3 V:** blue LEDs need about 3.0–3.2 V, so with the common on 3V3 the blue can be dim. Test it before building a batch (power the common from 3V3 and touch the blue pin to GND). If it's too dim, run the common from 5V and switch each colour through a logic-level N-MOSFET (2N7002 / AO3400), then set `LED_ACTIVE_LOW = false` in `src/clearcue/main.cpp`. Never connect 5V to a GPIO directly.
+**Blue at 3.3 V:** blue LEDs need about 3.0–3.2 V, so with the common on 3V3 the blue can be dim. It's fine on the buttons linked above, but if you use a different button, test it before building a batch (power the common from 3V3 and touch the blue pin to GND). If it's too dim, run the common from 5V and switch each colour through a logic-level N-MOSFET (2N7002 / AO3400), then set `LED_ACTIVE_LOW = false` in `src/clearcue/main.cpp`. Never connect 5V to a GPIO directly.
 
 ## Installing the firmware
 
@@ -72,17 +72,25 @@ For HTTPS: open **HTTPS certificate check → Trust this server**, compare the f
 
 | Light | Meaning |
 |---|---|
-| Solid green | Printer is ready, nothing to do |
-| Solid red | Printer busy, or the plate needs clearing |
+| Solid green | Printer is ready for the next job, nothing to do |
+| Solid red | Plate waiting to be cleared: press the button once it's clear |
+| Slow red breathing | Printing (or preparing to print) |
+| Fast red blink | Printer paused or in an error state |
+| Solid amber | The server says the printer is offline |
+| Slow amber blink | Can't reach the server: open the settings page and use **Test connection** |
 | Solid blue | Setup network is on (first setup, or Wi-Fi lost for over 5 minutes) |
 | Slow blue blink | On Wi-Fi, but server details still need filling in |
 | Fast red/green alternating | Connecting to Wi-Fi |
-| Slow red blink | Can't reach the server: open the settings page and use **Test connection** |
+| Red → green → blue cycling | **Identify** (from the settings page): this is the button you're looking for. A press stops it. |
 | White flicker | Button held over 3 s: release to cancel, keep holding to 10 s to factory reset |
+
+Brightness is adjustable under **Device → Light brightness** on the settings page.
+
+Watchtower's printer reply has `ready`, `busy` and `online` flags; "busy" shows as printing. Paused or error shows only if the reply also carries a status string that says so. Bambuddy reports printing, paused and plate-waiting directly.
 
 **Button**
 
-- **Short press**: Watchtower sends `set_ready` (only when the printer is online, not printing and not already ready); Bambuddy clears the plate (only when Bambuddy is waiting for one). Three green blinks = accepted, two green blinks = nothing to do, three red blinks = failed.
+- **Short press**: if the light is cycling for **Identify**, a press just stops it. Otherwise Watchtower sends `set_ready` (only when the printer is online, not printing and not already ready); Bambuddy clears the plate (only when Bambuddy is waiting for one). Three green blinks = accepted, two green blinks = nothing to do, three red blinks = failed.
 - **Hold 10 seconds**: factory reset. Erases all settings and returns to setup mode. The settings page has the same thing under **Device actions**.
 
 **Settings page**: `http://<device-name>.local` on your network. Optional settings password (user `admin`). The footer shows firmware version, device name and MAC address.

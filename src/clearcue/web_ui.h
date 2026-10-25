@@ -15,6 +15,10 @@ main{max-width:560px;margin:0 auto;padding:16px}
 h1{font-size:20px;margin:8px 0 2px}.sub{color:var(--mute);font-size:13px;margin-bottom:14px}
 section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px;margin:12px 0}
 h2{font-size:14px;text-transform:uppercase;letter-spacing:.04em;color:var(--mute);margin:0 0 10px}
+section.fold>h2{cursor:pointer;user-select:none;display:flex;align-items:center;gap:8px;margin:0}
+section.fold>h2::before{content:"▾";font-size:12px;transition:transform .15s}
+section.fold>.sb{margin-top:10px}
+section.fold.closed>h2::before{transform:rotate(-90deg)}section.fold.closed>.sb{display:none}
 label{display:block;font-size:13px;color:var(--mute);margin:10px 0 4px}
 input,select,textarea{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:7px;background:var(--bg);color:var(--fg);font:inherit}
 textarea{font:12px/1.3 ui-monospace,monospace;min-height:90px}
@@ -23,7 +27,10 @@ button{font:inherit;padding:9px 14px;border-radius:7px;border:1px solid var(--li
 button.pri{background:var(--acc);border-color:var(--acc);color:#fff}button.bad{color:var(--red)}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
 .dot{display:inline-block;width:12px;height:12px;border-radius:50%;vertical-align:-1px;margin-right:6px;background:var(--mute)}
-.dot.r{background:var(--red)}.dot.g{background:var(--grn)}
+.dot.r{background:var(--red)}.dot.g{background:var(--grn)}.dot.a{background:#d99a2b}
+.dot.br{background:var(--red);animation:br 3s ease-in-out infinite}@keyframes br{0%,100%{opacity:.15}50%{opacity:1}}
+.dot.bl{background:var(--red);animation:bl .5s steps(1) infinite}@keyframes bl{50%{opacity:0}}
+input[type=range]{padding:0;border:0;background:none;accent-color:var(--acc)}
 pre{white-space:pre-wrap;word-break:break-all;background:var(--bg);border:1px solid var(--line);border-radius:7px;padding:8px;font-size:12px;margin:8px 0 0}
 #msg{position:sticky;top:0;z-index:2;display:none;padding:10px 12px;border-radius:8px;background:var(--acc);color:#fff;margin-bottom:8px}
 details summary{cursor:pointer;color:var(--mute);font-size:13px;margin-top:10px}
@@ -71,13 +78,14 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0;font-size:1
 <p class="hint" style="margin-top:14px"><a href="#" id="showAll" style="color:var(--mute)">No computer? Set up everything on this phone instead</a></p>
 </section>
 
-<div id="step2" hidden><section style="border-color:var(--acc)"><div class="step">Step 2 of 2</div>Fill in the <b>Printer server</b> section below, then press <b>Save</b>.</section></div>
+<div id="step2" hidden><section style="border-color:var(--acc)"><div class="step">Step 2 of 2</div>Fill in the <b>Printer server</b> section below, then press <b>Save settings</b>.</section></div>
 
 <div id="full">
 <section><h2>Status</h2>
 <div id="state"><span class="dot"></span>Loading…</div>
 <dl id="info" style="margin-top:10px"></dl>
-<div class="row"><button id="btnTest">Test connection</button></div>
+<div class="row"><button id="btnTest">Test connection</button><button id="btnIdent">Identify</button></div>
+<div class="hint">Identify cycles the light red, green, blue for 15 s so you can find this button. Press the button to stop it.</div>
 <pre id="testOut" hidden></pre>
 </section>
 
@@ -117,15 +125,18 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0;font-size:1
 <label for="hostname">Device name (network hostname)</label>
 <input id="hostname" pattern="[a-z0-9-]{1,32}" autocomplete="off">
 <div class="hint">Lowercase letters, digits, hyphens. Reach this page at http://<b id="hn"></b>.local</div>
+<label for="bright">Light brightness: <b id="brightV"></b>%</label>
+<input id="bright" type="range" min="5" max="100" step="5">
+<div class="hint">Applied right away.</div>
 <label for="pollSec">Check every (seconds)</label>
 <input id="pollSec" type="number" min="5" max="300">
 <label for="adminPass">Settings password</label>
 <input id="adminPass" type="password" autocomplete="new-password">
 <div class="hint" id="adminHint">Protects this page (user name <b>admin</b>). Forgot it? Hold the button 10 s to factory reset.</div>
 <label style="display:flex;gap:8px;align-items:center;color:var(--fg);margin-top:14px" id="dbgRow"><input type="checkbox" id="debug" style="width:auto"> Serial debug logging</label>
-<div class="hint">Detailed log on the USB serial port (115200 baud): checks, server replies, button presses. Leave off unless troubleshooting. Takes effect when you press Save.</div>
-<div class="row"><button class="pri" type="submit">Save</button></div>
+<div class="hint">Detailed log on the USB serial port (115200 baud): checks, server replies, button presses. Leave off unless troubleshooting. Takes effect when you press Save settings.</div>
 </section>
+<div class="row" style="margin:0 0 12px"><button class="pri" type="submit">Save settings</button></div>
 </form>
 
 <section><h2>Firmware</h2>
@@ -135,6 +146,15 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0;font-size:1
 <input id="bin" type="file" accept=".bin">
 <div class="row"><button id="btnUpload">Upload</button></div>
 <div class="hint" style="margin-top:12px">Free software under the GNU GPL v3, with wolfSSL. <span id="src"></span></div>
+</section>
+
+<section><h2>Light test</h2>
+<div class="hint">Shows each light pattern for 20 s without contacting the printer server. The button won't send anything while a test is showing; pressing it just ends the test.</div>
+<div class="row" id="ltBtns"></div>
+<div class="row"><button id="ltStop" class="bad">Stop test</button></div>
+<label for="amb">Amber tuning (green mixed into red): <b id="ambV"></b></label>
+<input id="amb" type="range" min="0" max="255" step="5">
+<div class="hint">Moving this shows solid amber with the new mix. Lower = more orange, higher = more yellow. Not saved: note the number you like.</div>
 </section>
 
 <section><h2>Device actions</h2>
@@ -151,12 +171,23 @@ let cfg={};
 function msg(t,ms){const m=$("msg");m.textContent=t;m.style.display="block";if(ms)setTimeout(()=>m.style.display="none",ms)}
 async function api(p,o){const r=await fetch(p,o);if(!r.ok&&r.status!==200)throw new Error(p+" → HTTP "+r.status);return r.json()}
 function backendUi(){const b=B[$("backend").value];$("apiBase").placeholder=b.base;$("baseHint").textContent=b.baseHint;$("keyHint").textContent=(cfg.hasKey?"A key is saved; leave blank to keep it (changing the URL or server type clears it). ":"")+b.key;$("printerLbl").textContent=b.lbl;$("printer").placeholder=b.ph;$("printerHint").textContent=b.ph2}
-function dot(s){if(!s.configured)return'<span class="dot"></span>Not set up yet';if(!s.wifi)return'<span class="dot"></span>Not connected to Wi-Fi';if(!s.poll||!s.poll.ok)return'<span class="dot r"></span>Can\'t reach the printer server';return s.poll.red?'<span class="dot r"></span>Red: printer busy or plate needs clearing':'<span class="dot g"></span>Green: ready'}
+function dot(s){if(!s.configured)return'<span class="dot"></span>Not set up yet';if(!s.wifi)return'<span class="dot"></span>Not connected to Wi-Fi';if(!s.poll||!s.poll.ok)return'<span class="dot r"></span>Can\'t reach the printer server';const st={ready:'<span class="dot g"></span>Green: ready for the next job',plate:'<span class="dot r"></span>Red: plate waiting to be cleared (press the button)',printing:'<span class="dot br"></span>Red breathing: printing',paused:'<span class="dot bl"></span>Red blinking: paused or printer error',offline:'<span class="dot a"></span>Amber: printer offline'};return (st[s.poll.state]||(s.poll.red?'<span class="dot r"></span>Red':'<span class="dot g"></span>Green'))+(s.identify?' · identifying ('+s.identify+' s)':'')+(s.lightTest?' · light test ('+s.lightTest+' s)':'')}
 async function refresh(){try{const s=await api("/api/info");$("step2").hidden=!(s.wifi&&!s.configured&&!setupMode);$("title").textContent=s.product+" setup";$("subtitle").textContent=s.ap?("Setup network: "+s.apSsid):("http://"+s.host+".local · "+s.ip);$("state").innerHTML=dot(s);
 $("info").innerHTML=[["Wi-Fi",s.wifi?(s.ssid+" ("+s.rssi+" dBm)"):"—"],["IP",s.ip||"—"],["MAC",s.mac],["Last check",s.poll&&s.poll.age>=0?(s.poll.age+" s ago · "+(s.poll.summary||s.poll.hint)):"—"]].map(r=>"<dt>"+r[0]+"</dt><dd>"+esc(r[1])+"</dd>").join("");$("ver").textContent=s.version;$("foot").textContent=s.product+" "+s.version+" · "+s.host+" · "+s.mac;$("src").innerHTML=s.source?'Source code and licenses: <a href="'+esc(s.source)+'" style="color:var(--acc)">'+esc(s.source)+"</a>":""}catch(e){}}
 function esc(x){return String(x??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
-async function load(){cfg=await api("/api/config");for(const k of["ssid","backend","apiBase","printer","caCert","hostname","pollSec"])$(k).value=cfg[k]??"";$("hn").textContent=cfg.hostname;$("pass").placeholder=cfg.hasPass?"•••••• (saved)":"";$("apiKey").placeholder=cfg.hasKey?"•••••• (saved)":"";$("debug").checked=!!cfg.debug;$("dbgRow").style.display=cfg.debugAvailable===false?"none":"flex";$("adminPass").placeholder=cfg.hasAdmin?"•••••• (set, type to change)":"Optional";backendUi();caState();if(cfg.caCert)$("tlsBox").open=true;refresh()}
-$("backend").onchange=backendUi;$("hostname").oninput=e=>$("hn").textContent=e.target.value;
+async function load(){cfg=await api("/api/config");for(const k of["ssid","backend","apiBase","printer","caCert","hostname","pollSec"])$(k).value=cfg[k]??"";$("hn").textContent=cfg.hostname;$("pass").placeholder=cfg.hasPass?"•••••• (saved)":"";$("apiKey").placeholder=cfg.hasKey?"•••••• (saved)":"";$("debug").checked=!!cfg.debug;$("bright").value=cfg.brightness??100;$("brightV").textContent=$("bright").value;$("dbgRow").style.display=cfg.debugAvailable===false?"none":"flex";$("adminPass").placeholder=cfg.hasAdmin?"•••••• (set, type to change)":"Optional";backendUi();caState();if(cfg.caCert)$("tlsBox").open=true;refresh()}
+$("backend").onchange=backendUi;
+$("bright").oninput=e=>$("brightV").textContent=e.target.value;
+$("bright").onchange=async e=>{try{await api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({brightness:+e.target.value})})}catch(x){msg(x.message,3000)}};
+const LT=[["ready","Ready (green)"],["plate","Plate waiting (red)"],["printing","Printing (breathing)"],["paused","Paused / error"],["offline","Printer offline (amber)"],["error","Server unreachable (amber blink)"],["setup","Setup network"],["settings","Needs settings"],["joining","Joining Wi-Fi"],["identify","Identify"],["resetwarn","Reset warning"],["accepted","Press: accepted"],["nothing","Press: nothing to do"],["failed","Press: failed"]];
+$("ltBtns").innerHTML=LT.map(x=>'<button type="button" data-m="'+x[0]+'">'+x[1]+'</button>').join("");
+async function lt(m){try{const r=await api("/api/ledtest",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode:m,seconds:20})});if(!r.ok)msg(r.error,3000);else if(r.seconds)msg("Showing: "+LT.find(x=>x[0]===m)[1]+" for "+r.seconds+" s",2500)}catch(e){msg(e.message,3000)}}
+$("ltBtns").onclick=e=>{const m=e.target.dataset&&e.target.dataset.m;if(m)lt(m)};
+$("ltStop").onclick=()=>lt("stop");
+$("amb").value=145;$("ambV").textContent=145;
+$("amb").oninput=e=>$("ambV").textContent=e.target.value;
+$("amb").onchange=async e=>{try{await api("/api/ledtest",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode:"offline",seconds:30,amberGreen:+e.target.value})})}catch(x){msg(x.message,3000)}};
+$("btnIdent").onclick=async()=>{try{const r=await api("/api/identify",{method:"POST",headers:{"Content-Type":"application/json"},body:'{"seconds":15}'});msg("Identifying for "+r.seconds+" s: look for the light cycling red, green, blue.",4000);refresh()}catch(e){msg(e.message,4000)}};$("hostname").oninput=e=>$("hn").textContent=e.target.value;
 function bars(r){return r>=-60?"▂▄▆█":r>=-70?"▂▄▆":r>=-80?"▂▄":"▂"}
 $("btnScan").onclick=async()=>{const b=$("btnScan");b.disabled=true;b.textContent="Scanning…";
 try{const n=(await api("/api/scan")).sort((a,c)=>c.rssi-a.rssi),sel=$("nets");
@@ -166,7 +197,7 @@ sel.innerHTML='<option value="">Choose a network ('+n.length+' found)…</option
 sel.hidden=false;sel.focus()}
 catch(e){msg("Scan failed: "+e.message,4000)}finally{b.disabled=false;b.textContent="Scan again"}};
 $("nets").onchange=e=>{if(!e.target.value)return;$("ssid").value=e.target.value;const p=$("pass");p.value="";p.focus()};
-$("f").onsubmit=async e=>{e.preventDefault();const b={};for(const k of["ssid","pass","backend","apiBase","apiKey","printer","caCert","hostname","adminPass"])b[k]=$(k).value.trim();b.pollSec=+$("pollSec").value||10;b.debug=$("debug").checked;
+$("f").onsubmit=async e=>{e.preventDefault();const b={};for(const k of["ssid","pass","backend","apiBase","apiKey","printer","caCert","hostname","adminPass"])b[k]=$(k).value.trim();b.pollSec=+$("pollSec").value||10;b.brightness=+$("bright").value||100;b.debug=$("debug").checked;
 try{const r=await api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});if(!r.ok){msg(r.error||"Save failed");return}
 if(r.reboot){msg("Saved. Restarting and joining "+b.ssid+". Reconnect your phone/PC to that network, then open http://"+b.hostname+".local")}else{msg("Saved.",2500);$("pass").value="";$("apiKey").value="";$("adminPass").value="";load();setTimeout(()=>$("btnTest").click(),300)}}catch(e){msg(e.message)}};
 $("btnTest").onclick=async()=>{const o=$("testOut");o.hidden=false;o.textContent="Testing…";try{const r=await api("/api/test",{method:"POST"});o.textContent=(r.ok?"✓ ":"✗ ")+r.hint+"\n\nURL:  "+r.url+"\nHTTP: "+r.http+(r.transport?"\nError: "+r.transport:"")+(r.tls?"\nTLS: "+r.tls:"")+(r.summary?"\nRead: "+r.summary:"")+(r.body?"\nBody: "+r.body:"");refresh()}catch(e){o.textContent=e.message}};
@@ -217,8 +248,19 @@ $("wRetry").onclick=()=>{show("wBusy");wPoll()};
 $("wFinish").onclick=async()=>{try{const r=await api("/api/ap/close",{method:"POST"});if(!r.ok){msg(r.error,4000);return}
 $("setup").innerHTML='<p style="margin:0">Setup network turned off. Reconnect your phone to your usual Wi-Fi.</p><p class="hint">Finish setup on your computer at <b>'+esc(wHost())+'</b>.</p>'}catch(e){msg(e.message,4000)}};
 $("showAll").onclick=e=>{e.preventDefault();$("full").hidden=false;$("setup").hidden=true;setupMode=false;$("full").scrollIntoView()};
+// Collapsible sections. Once the button is set up, Wi-Fi, Printer server, Light test and
+// Device actions start folded; each section remembers being opened/closed in this browser.
+const FOLDED=["Wi-Fi","Printer server","Light test","Device actions"];
+function folds(conf){document.querySelectorAll("#full section").forEach(sec=>{const h=sec.querySelector(":scope>h2");if(!h||sec.classList.contains("fold"))return;
+const name=h.textContent.trim(),b=document.createElement("div");b.className="sb";while(h.nextSibling)b.appendChild(h.nextSibling);sec.appendChild(b);sec.classList.add("fold");
+let st=null;try{st=localStorage.getItem("cc.fold."+name)}catch(e){}
+sec.classList.toggle("closed",st?st==="c":!!conf&&FOLDED.includes(name));
+h.onclick=()=>{const c=sec.classList.toggle("closed");try{localStorage.setItem("cc.fold."+name,c?"c":"o")}catch(e){}}})}
+// A required field in a folded section would block Save silently: open its section.
+document.addEventListener("invalid",e=>{const sec=e.target.closest("section.fold");if(sec)sec.classList.remove("closed")},true);
 async function boot(){let s=null;try{s=await api("/api/info")}catch(e){}
 try{await load()}catch(e){}
+folds(s&&s.configured);
 if(s&&s.ap&&!s.wifi){setupMode=true;wInfo={host:s.host,apSsid:s.apSsid};wFill();$("setup").hidden=false;$("full").hidden=true;
 let w=null;try{w=await api("/api/wifi")}catch(e){}
 if(w&&w.state==="connecting"){$("wName").textContent=w.ssid;show("wBusy");wPoll()}else{show("wForm");wScan()}}
