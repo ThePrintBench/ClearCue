@@ -24,14 +24,42 @@ def git(*args, cwd=None):
     return subprocess.check_output(["git", *args], cwd=cwd, stderr=subprocess.STDOUT).decode().strip()
 
 
+def _rmtree(path):
+    # Git marks pack files read-only; on Windows shutil.rmtree can't delete those without
+    # clearing the flag first.
+    import shutil, stat
+    def onerror(func, p, _exc):
+        os.chmod(p, stat.S_IWRITE)
+        func(p)
+    shutil.rmtree(path, onerror=onerror)
+
+
+def _checkout_head():
+    """HEAD of an existing checkout, or None if it's missing or broken (e.g. a clone that was
+    interrupted, which leaves a .git with no commit and makes rev-parse exit 128)."""
+    if not os.path.isdir(os.path.join(dest, ".git")):
+        return None
+    try:
+        return git("rev-parse", "HEAD", cwd=dest)
+    except subprocess.CalledProcessError as e:
+        out = e.output.decode(errors="replace")
+        if "dubious ownership" in out or "safe.directory" in out:
+            raise SystemExit(
+                "[wolfssl] git refuses to read " + dest + " because it's owned by another user.\n"
+                "Run:  git config --global --add safe.directory \"" + dest.replace(os.sep, "/") + "\"\n"
+                "or delete that folder and build again.\n" + out)
+        print(f"[wolfssl] {dest} is not a usable checkout ({out.strip()}); re-fetching")
+        return ""
+
+
 def ensure_source():
-    if os.path.isdir(os.path.join(dest, ".git")):
-        head = git("rev-parse", "HEAD", cwd=dest)
-        if head == WOLFSSL_COMMIT:
-            return
-        print(f"[wolfssl] {dest} is at {head}, expected {WOLFSSL_COMMIT}; re-fetching")
-        import shutil
-        shutil.rmtree(dest)
+    head = _checkout_head()
+    if head == WOLFSSL_COMMIT:
+        return
+    if head is not None or os.path.exists(dest):
+        if head:
+            print(f"[wolfssl] {dest} is at {head}, expected {WOLFSSL_COMMIT}; re-fetching")
+        _rmtree(dest)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     print(f"[wolfssl] fetching {WOLFSSL_URL} {WOLFSSL_TAG} (one time)")
     try:
@@ -39,6 +67,8 @@ def ensure_source():
     except FileNotFoundError:
         raise SystemExit("[wolfssl] git is not on PATH; install Git for Windows or add it to PATH")
     except subprocess.CalledProcessError as e:
+        if os.path.exists(dest):
+            _rmtree(dest)          # don't leave a half-cloned folder behind for the next build
         raise SystemExit("[wolfssl] clone failed:\n" + e.output.decode(errors="replace"))
     head = git("rev-parse", "HEAD", cwd=dest)
     if head != WOLFSSL_COMMIT:
