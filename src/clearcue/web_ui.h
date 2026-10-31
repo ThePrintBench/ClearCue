@@ -133,6 +133,7 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0;font-size:1
 <label for="adminPass">Settings password</label>
 <input id="adminPass" type="password" autocomplete="new-password">
 <div class="hint" id="adminHint">Protects this page (user name <b>admin</b>). Forgot it? Hold the button 10 s to factory reset.</div>
+<div class="row" id="adminClearRow" style="display:none"><button type="button" id="btnClearAdmin" class="bad">Remove password</button></div>
 <label style="display:flex;gap:8px;align-items:center;color:var(--fg);margin-top:14px" id="dbgRow"><input type="checkbox" id="debug" style="width:auto"> Serial debug logging</label>
 <div class="hint">Detailed log on the USB serial port (115200 baud): checks, server replies, button presses. Leave off unless troubleshooting. Takes effect when you press Save settings.</div>
 </section>
@@ -175,7 +176,7 @@ function dot(s){if(!s.configured)return'<span class="dot"></span>Not set up yet'
 async function refresh(){try{const s=await api("/api/info");$("step2").hidden=!(s.wifi&&!s.configured&&!setupMode);$("title").textContent=s.product+" setup";$("subtitle").textContent=s.ap?("Setup network: "+s.apSsid):("http://"+s.host+".local · "+s.ip);$("state").innerHTML=dot(s);
 $("info").innerHTML=[["Wi-Fi",s.wifi?(s.ssid+" ("+s.rssi+" dBm)"):"—"],["IP",s.ip||"—"],["MAC",s.mac],["Last check",s.poll&&s.poll.age>=0?(s.poll.age+" s ago · "+(s.poll.summary||s.poll.hint)):"—"]].map(r=>"<dt>"+r[0]+"</dt><dd>"+esc(r[1])+"</dd>").join("");$("ver").textContent=s.version;$("foot").textContent=s.product+" "+s.version+" · "+s.host+" · "+s.mac;$("src").innerHTML=s.source?'Source code and licenses: <a href="'+esc(s.source)+'" style="color:var(--acc)">'+esc(s.source)+"</a>":""}catch(e){}}
 function esc(x){return String(x??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]))}
-async function load(){cfg=await api("/api/config");for(const k of["ssid","backend","apiBase","printer","caCert","hostname","pollSec"])$(k).value=cfg[k]??"";$("hn").textContent=cfg.hostname;$("pass").placeholder=cfg.hasPass?"•••••• (saved)":"";$("apiKey").placeholder=cfg.hasKey?"•••••• (saved)":"";$("debug").checked=!!cfg.debug;$("bright").value=cfg.brightness??100;$("brightV").textContent=$("bright").value;$("dbgRow").style.display=cfg.debugAvailable===false?"none":"flex";$("adminPass").placeholder=cfg.hasAdmin?"•••••• (set, type to change)":"Optional";backendUi();caState();if(cfg.caCert)$("tlsBox").open=true;refresh()}
+async function load(){cfg=await api("/api/config");for(const k of["ssid","backend","apiBase","printer","caCert","hostname","pollSec"])$(k).value=cfg[k]??"";$("hn").textContent=cfg.hostname;$("pass").placeholder=cfg.hasPass?"•••••• (saved)":"";$("apiKey").placeholder=cfg.hasKey?"•••••• (saved)":"";$("debug").checked=!!cfg.debug;$("bright").value=cfg.brightness??100;$("brightV").textContent=$("bright").value;$("dbgRow").style.display=cfg.debugAvailable===false?"none":"flex";$("adminPass").placeholder=cfg.hasAdmin?"•••••• (set, type to change)":"Optional";$("adminClearRow").style.display=cfg.hasAdmin?"flex":"none";backendUi();caState();if(cfg.caCert)$("tlsBox").open=true;refresh()}
 $("backend").onchange=backendUi;
 $("bright").oninput=e=>$("brightV").textContent=e.target.value;
 $("bright").onchange=async e=>{try{await api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({brightness:+e.target.value})})}catch(x){msg(x.message,3000)}};
@@ -187,6 +188,8 @@ $("ltStop").onclick=()=>lt("stop");
 $("amb").value=145;$("ambV").textContent=145;
 $("amb").oninput=e=>$("ambV").textContent=e.target.value;
 $("amb").onchange=async e=>{try{await api("/api/ledtest",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mode:"offline",seconds:30,amberGreen:+e.target.value})})}catch(x){msg(x.message,3000)}};
+$("btnClearAdmin").onclick=async()=>{if(!confirm("Remove the settings password? Anyone on your network will be able to open this page."))return;
+try{const r=await api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:'{"clearAdmin":true}'});if(!r.ok){msg(r.error||"Failed",4000);return}$("adminPass").value="";msg("Password removed.",3000);load()}catch(e){msg(e.message,4000)}};
 $("btnIdent").onclick=async()=>{try{const r=await api("/api/identify",{method:"POST",headers:{"Content-Type":"application/json"},body:'{"seconds":15}'});msg("Identifying for "+r.seconds+" s: look for the light cycling red, green, blue.",4000);refresh()}catch(e){msg(e.message,4000)}};$("hostname").oninput=e=>$("hn").textContent=e.target.value;
 function bars(r){return r>=-60?"▂▄▆█":r>=-70?"▂▄▆":r>=-80?"▂▄":"▂"}
 $("btnScan").onclick=async()=>{const b=$("btnScan");b.disabled=true;b.textContent="Scanning…";
