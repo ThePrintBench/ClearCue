@@ -58,6 +58,7 @@
 #include <esp_mac.h>
 #include <esp_system.h>
 #include <memory>
+#include "ping/ping_sock.h"
 
 #include "version.h"
 #include "web_ui.h"
@@ -461,10 +462,13 @@ String hintFor(const PollResult& r) {
         return "The server's certificate is expired or not yet valid.";
       default: break;
     }
+    // A refused TCP connection also leaves a TLS socket error behind, so check it first:
+    // nothing is listening on that address/port (or a firewall rejected it).
+    if (t.indexOf("refused") >= 0)
+      return "The server refused the connection: nothing is accepting connections on that address and port, "
+             "or a firewall rejected it. Check the address, the port, and http:// vs https://.";
     if (r.tls.length() || t.indexOf("SSL") >= 0 || t.indexOf("TLS") >= 0)
       return "HTTPS handshake failed. Check http:// vs https:// and the port.";
-    if (t.indexOf("refused") >= 0)
-      return "The server refused the connection. Check the address, port, and http:// vs https://.";
     if (t.indexOf("not connected") >= 0 || t.indexOf("Wi-Fi") >= 0)
       return "The button isn't on Wi-Fi.";
     return "Can't reach the server. Check the address and that this Wi-Fi network can reach it.";
@@ -971,6 +975,174 @@ void handleTest() {
   sendJson(d);
 }
 
+// POST /api/probe: step-by-step check of a printer-server URL (name lookup -> ping -> TCP connect ->
+// HTTPS/HTTP request), so "can't connect" problems can be pinned down.
+//   {}                                       -> test the saved settings (same as /api/test)
+//   {"apiBase","backend","printer","apiKey","caCert"} -> test these values without saving them.
+// A blank apiKey reuses the saved key only if the URL and server type are unchanged, so the
+// saved key is never sent to a server it wasn't entered for.
+struct UrlParts { bool ok = false, tls = false; String host; uint16_t port = 0; };
+UrlParts parseBase(String b) {
+  UrlParts u; b.trim();
+  if (b.startsWith("https://")) { u.tls = true; b.remove(0, 8); }
+  else if (b.startsWith("http://")) { b.remove(0, 7); }
+  else return u;
+  int slash = b.indexOf('/');
+  String hp = slash >= 0 ? b.substring(0, slash) : b;
+  int at = hp.lastIndexOf('@'); if (at >= 0) hp.remove(0, at + 1);
+  u.port = u.tls ? 443 : 80;
+  if (hp.startsWith("[")) return u;                       // IPv6 literals: not supported here
+  int colon = hp.lastIndexOf(':');
+  if (colon >= 0) {
+    long p = hp.substring(colon + 1).toInt();
+    if (p <= 0 || p > 65535) return u;
+    u.port = (uint16_t)p; hp = hp.substring(0, colon);
+  }
+  u.host = hp;
+  u.ok = hp.length() > 0;
+  return u;
+}
+
+// ICMP echo to `ip`: `count` pings, each waiting up to timeout_ms. Blocks until done.
+struct PingStats { uint32_t sent = 0, received = 0, minMs = 0, maxMs = 0, sumMs = 0; };
+PingStats pingHost(IPAddress ip, uint32_t count = 4, uint32_t timeoutMs = 1000) {
+  struct Ctx { PingStats st; SemaphoreHandle_t done; } ctx;
+  ctx.done = xSemaphoreCreateBinary();
+  esp_ping_config_t pc = ESP_PING_DEFAULT_CONFIG();
+  pc.count = count; pc.interval_ms = 250; pc.timeout_ms = timeoutMs; pc.data_size = 32;
+  IP_ADDR4(&pc.target_addr, ip[0], ip[1], ip[2], ip[3]);
+  esp_ping_callbacks_t cb = {};
+  cb.cb_args = &ctx;
+  cb.on_ping_success = [](esp_ping_handle_t h, void* a) {
+    Ctx* c = (Ctx*)a; uint32_t t = 0;
+    esp_ping_get_profile(h, ESP_PING_PROF_TIMEGAP, &t, sizeof(t));
+    if (!c->st.received || t < c->st.minMs) c->st.minMs = t;
+    if (t > c->st.maxMs) c->st.maxMs = t;
+    c->st.sumMs += t; c->st.received++;
+  };
+  cb.on_ping_end = [](esp_ping_handle_t h, void* a) {
+    Ctx* c = (Ctx*)a;
+    esp_ping_get_profile(h, ESP_PING_PROF_REQUEST, &c->st.sent, sizeof(c->st.sent));
+    xSemaphoreGive(c->done);
+  };
+  esp_ping_handle_t h;
+  if (esp_ping_new_session(&pc, &cb, &h) == ESP_OK) {
+    esp_ping_start(h);
+    xSemaphoreTake(ctx.done, pdMS_TO_TICKS(count * (timeoutMs + 250) + 2000));
+    esp_ping_stop(h);
+    esp_ping_delete_session(h);
+  }
+  vSemaphoreDelete(ctx.done);
+  return ctx.st;
+}
+
+void handleProbe() {
+  if (!authorized()) return;
+  JsonDocument in; deserializeJson(in, server.arg("plain"));
+  bool custom = !in["apiBase"].isNull();
+  Config saved = cfg;                                      // restored before returning
+  if (custom) {
+    auto str = [&](const char* k) -> String { String v = in[k] | ""; v.trim(); return v; };
+    cfg.apiBase = str("apiBase");
+    if (in["backend"].is<const char*>()) cfg.backend = str("backend") == "bambuddy" ? "bambuddy" : "watchtower";
+    if (in["printer"].is<const char*>()) cfg.printer = str("printer");
+    if (in["caCert"].is<const char*>()) cfg.caCert = str("caCert");
+    if (str("apiKey").length()) cfg.apiKey = str("apiKey");
+    else if (cfg.apiBase != saved.apiBase || cfg.backend != saved.backend) cfg.apiKey = "";
+  }
+  JsonDocument d;
+  JsonArray steps = d["steps"].to<JsonArray>();
+  auto step = [&](const char* name, bool ok, const String& detail, uint32_t ms, bool warn = false) {
+    JsonObject o = steps.add<JsonObject>();
+    o["name"] = name; o["ok"] = ok; o["detail"] = detail; o["ms"] = ms;
+    if (warn) o["warn"] = true;
+    DBG("[probe] %s: %s %s (%lu ms)\n", name, ok ? "ok" : "FAIL", detail.c_str(), (unsigned long)ms);
+  };
+  auto finish = [&]() {
+    cfg = saved; configureTls();
+    sendJson(d);
+  };
+  d["url"] = cfg.apiBase;
+
+  if (WiFi.status() != WL_CONNECTED) { step("Wi-Fi", false, "The button isn't on Wi-Fi.", 0); finish(); return; }
+  step("Wi-Fi", true, WiFi.SSID() + ", " + WiFi.localIP().toString() + ", " + String(WiFi.RSSI()) + " dBm", 0);
+
+  UrlParts u = parseBase(cfg.apiBase);
+  if (!u.ok) {
+    step("URL", false, "Not a valid URL. It must look like https://host[:port]/api/...", 0);
+    finish(); return;
+  }
+  step("URL", true, String(u.tls ? "HTTPS" : "HTTP") + " to " + u.host + " port " + u.port, 0);
+
+  // 1. Name lookup
+  IPAddress ip;
+  uint32_t t0 = millis();
+  bool isIp = ip.fromString(u.host);
+  if (!isIp) {
+    bool ok = WiFi.hostByName(u.host.c_str(), ip) == 1 && ip != IPAddress((uint32_t)0);
+    uint32_t dt = millis() - t0;
+    if (!ok) {
+      step("Name lookup", false, "Couldn't resolve " + u.host + ". Check the spelling, or use the IP address" +
+           (u.host.endsWith(".local") ? " (.local names often don't resolve from the button)." : "."), dt);
+      finish(); return;
+    }
+    step("Name lookup", true, u.host + " -> " + ip.toString(), dt);
+  } else {
+    step("Name lookup", true, u.host + " is an IP address", 0);
+  }
+
+  // 2. ICMP ping. Informational only: many hosts and firewalls drop pings, so a failure
+  //    here doesn't stop the test.
+  {
+    t0 = millis();
+    PingStats ps = pingHost(ip);
+    uint32_t dt = millis() - t0;
+    if (ps.received) {
+      step("Ping", true, String(ps.received) + "/" + ps.sent + " replies from " + ip.toString() + ", " +
+           ps.minMs + "/" + (ps.sumMs / ps.received) + "/" + ps.maxMs + " ms min/avg/max" +
+           (ps.received < ps.sent ? " (some lost: weak Wi-Fi or a busy network)" : ""), dt);
+    } else {
+      step("Ping", false, "No replies from " + ip.toString() + ". The host may be down or unreachable, or it (or a "
+           "firewall) just ignores pings, which is common. Carrying on to the port test.", dt, true);
+    }
+  }
+
+  // 3. TCP connect
+  {
+    const int32_t TCP_TIMEOUT_MS = 5000;
+    WiFiClient c;
+    t0 = millis();
+    bool ok = c.connect(ip, u.port, TCP_TIMEOUT_MS);
+    uint32_t dt = millis() - t0;
+    c.stop();
+    if (!ok) {
+      String why = dt + 500 >= (uint32_t)TCP_TIMEOUT_MS
+        ? "No answer within " + String(TCP_TIMEOUT_MS / 1000) + " s: the host is down or unreachable, or a firewall "
+          "is silently dropping traffic from the button's network."
+        : "Refused: the host answered but nothing accepts connections on port " + String(u.port) +
+          " (wrong port, service not running, or a firewall rejecting it).";
+      step("Connect", false, ip.toString() + ":" + u.port + " - " + why, dt);
+      finish(); return;
+    }
+    step("Connect", true, ip.toString() + ":" + u.port + " accepts connections", dt);
+  }
+
+  // 4. The real request, exactly as the button makes it
+  if (!cfg.apiKey.length() || !cfg.printer.length()) {
+    step("Request", false, !cfg.apiKey.length() ? "Enter the API key to test the request itself."
+                                                 : "Enter the printer to test the request itself.", 0);
+    finish(); return;
+  }
+  configureTls();
+  t0 = millis();
+  PollResult r = pollOnce();
+  uint32_t dt = millis() - t0;
+  step(u.tls ? "HTTPS request" : "HTTP request", r.ok, r.ok ? r.summary : r.hint, dt);
+  fillPoll(d["poll"].to<JsonObject>(), r);
+  if (!custom) { cfg = saved; configureTls(); applyPoll(r); sendJson(d); return; }
+  finish();
+}
+
 void handleScan() {
   if (!authorized()) return;
   int n = WiFi.scanNetworks();
@@ -1242,6 +1414,7 @@ void setupServer() {
   server.on("/api/config", HTTP_GET, handleGetConfig);
   server.on("/api/config", HTTP_POST, handlePostConfig);
   server.on("/api/test", HTTP_POST, handleTest);
+  server.on("/api/probe", HTTP_POST, handleProbe);
   server.on("/api/trust", HTTP_POST, handleTrust);
   server.on("/api/scan", HTTP_GET, handleScan);
   server.on("/api/wifi", HTTP_POST, handleWifiPost);

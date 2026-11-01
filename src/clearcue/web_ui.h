@@ -112,6 +112,9 @@ dl{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;margin:0;font-size:1
 <label for="printer" id="printerLbl">Printer</label>
 <input id="printer" autocomplete="off" required>
 <div class="hint" id="printerHint"></div>
+<div class="row"><button type="button" id="btnProbe">Test these settings</button></div>
+<div class="hint">Checks what's typed above without saving: name lookup, ping, connecting to the port, then the request itself.</div>
+<pre id="probeOut" hidden></pre>
 <details id="tlsBox"><summary>HTTPS certificate check</summary>
 <div class="hint" id="caState"></div>
 <div class="row"><button type="button" id="btnTrust">Trust this server</button><button type="button" id="btnUntrust" class="bad">Stop checking</button></div>
@@ -203,7 +206,11 @@ $("nets").onchange=e=>{if(!e.target.value)return;$("ssid").value=e.target.value;
 $("f").onsubmit=async e=>{e.preventDefault();const b={};for(const k of["ssid","pass","backend","apiBase","apiKey","printer","caCert","hostname","adminPass"])b[k]=$(k).value.trim();b.pollSec=+$("pollSec").value||10;b.brightness=+$("bright").value||100;b.debug=$("debug").checked;
 try{const r=await api("/api/config",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(b)});if(!r.ok){msg(r.error||"Save failed");return}
 if(r.reboot){msg("Saved. Restarting and joining "+b.ssid+". Reconnect your phone/PC to that network, then open http://"+b.hostname+".local")}else{msg("Saved.",2500);$("pass").value="";$("apiKey").value="";$("adminPass").value="";load();setTimeout(()=>$("btnTest").click(),300)}}catch(e){msg(e.message)}};
-$("btnTest").onclick=async()=>{const o=$("testOut");o.hidden=false;o.textContent="Testing…";try{const r=await api("/api/test",{method:"POST"});o.textContent=(r.ok?"✓ ":"✗ ")+r.hint+"\n\nURL:  "+r.url+"\nHTTP: "+r.http+(r.transport?"\nError: "+r.transport:"")+(r.tls?"\nTLS: "+r.tls:"")+(r.summary?"\nRead: "+r.summary:"")+(r.body?"\nBody: "+r.body:"");refresh()}catch(e){o.textContent=e.message}};
+function probeText(r){let t=r.steps.map(s=>(s.ok?"✓ ":s.warn?"⚠ ":"✗ ")+s.name+(s.ms?" ("+s.ms+" ms)":"")+"\n   "+s.detail).join("\n");const p=r.poll;
+if(p&&!p.ok)t+="\n\nURL:  "+p.url+"\nHTTP: "+p.http+(p.transport?"\nError: "+p.transport:"")+(p.tls?"\nTLS: "+p.tls:"")+(p.body?"\nBody: "+p.body:"");return t}
+async function probe(out,body){const o=$(out);o.hidden=false;o.textContent="Testing…";try{const r=await api("/api/probe",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});o.textContent=probeText(r);refresh()}catch(e){o.textContent=e.message}}
+$("btnTest").onclick=()=>probe("testOut",{});
+$("btnProbe").onclick=()=>{const b={};for(const k of["apiBase","backend","printer","apiKey","caCert"])b[k]=$(k).value.trim();probe("probeOut",b)};
 $("btnCheck").onclick=async()=>{msg("Checking…");try{const r=await api("/api/ota",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"});if(!r.ok){msg(r.error,4000);return}$("latest").textContent=r.latest;$("btnInstall").hidden=!r.newer;msg(r.newer?"Update available.":"Up to date.",3000)}catch(e){msg(e.message,4000)}};
 $("btnInstall").onclick=async()=>{if(!confirm("Install the update? The button restarts when done."))return;await api("/api/ota",{method:"POST",headers:{"Content-Type":"application/json"},body:'{"install":true}'});msg("Updating… the button will restart in about a minute.")};
 $("btnUpload").onclick=async()=>{const f=$("bin").files[0];if(!f){msg("Choose a .bin first",3000);return}if(/factory/i.test(f.name)){msg("That's the full factory image. Upload the -app.bin file instead.",5000);return}const fd=new FormData();fd.append("firmware",f,f.name);msg("Uploading…");try{const r=await fetch("/update",{method:"POST",body:fd});const t=await r.text();msg(r.ok?"Update installed. Restarting…":("Upload failed: "+t))}catch(e){msg("Upload failed: "+e.message)}};
